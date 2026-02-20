@@ -15,19 +15,22 @@ const GEMINI_API_URL =
   'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
 
 export interface AISummary {
-  what: string;
-  done: string;
-  decisions: string;
-  next: string;
-  warnings: string;
-  context: string;
+  what: string;        // What was being built / the goal
+  done: string;        // What was completed this session
+  decisions: string;   // Key architectural/technical decisions made
+  next: string;        // What to do next (pending tasks)
+  warnings: string;    // Gotchas, failed commands, dead-ends
+  context: string;     // Full prose handoff block for the target tool
 }
 
+/**
+ * Build the prompt sent to Gemini from a UnifiedSession.
+ */
 function buildPrompt(session: UnifiedSession, toolSummaries: ToolUsageSummary[]): string {
   const toolLines = toolSummaries
     .map(t => {
-      const samples = t.samples.slice(0, 3).map(s => `    - ${s.summary}`).join('\n');
-      return `  ${t.name} (x${t.count}):\n${samples}`;
+      const samples = t.samples.slice(0, 3).map(s => `    • ${s.summary}`).join('\n');
+      return `  ${t.name} (×${t.count}):\n${samples}`;
     })
     .join('\n');
 
@@ -45,7 +48,7 @@ Analyze the session context below and produce a structured handoff summary.
 Tool: ${session.source}
 Project: ${session.repo || session.cwd}
 Directory: ${session.cwd}
-Updated: ${session.updatedAt.toISOString()}
+Duration: ${session.updatedAt.toISOString()}
 Summary: ${session.summary || '(none)'}
 
 --- FILES MODIFIED ---
@@ -69,11 +72,64 @@ Respond with a JSON object (no markdown, raw JSON only) with these exact keys:
 }`;
 }
 
+// ---------------------------------------------------------------------------
+// Pro key validation
+// ---------------------------------------------------------------------------
+
+const PRO_VALIDATION_URL = 'https://continues-pro.vercel.app/api/validate-key';
+
+export class ProKeyError extends Error {
+  constructor() {
+    super(
+      '\n' +
+      '  --ai-summary requires a Continues Pro key.\n' +
+      '\n' +
+      '  Get one at: https://continues-pro.vercel.app\n' +
+      '  Plans start at $9/mo. Set CONTINUES_PRO_KEY after signup.\n' +
+      '\n' +
+      '  Free alternative: omit --ai-summary (full context still handed off).\n',
+    );
+    this.name = 'ProKeyError';
+  }
+}
+
+/**
+ * Validate a CONTINUES_PRO_KEY against the licensing endpoint.
+ * Returns true if valid, throws ProKeyError if invalid/missing.
+ */
+async function validateProKey(proKey: string): Promise<void> {
+  try {
+    const res = await fetch(PRO_VALIDATION_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: proKey }),
+    });
+    if (!res.ok) throw new ProKeyError();
+    const data = await res.json() as any;
+    if (!data?.valid) throw new ProKeyError();
+  } catch (err) {
+    if (err instanceof ProKeyError) throw err;
+    // Network failure — fail open so offline users aren't blocked
+    console.warn('[continues] Pro key validation skipped (network unavailable).');
+  }
+}
+
+/**
+ * Call the Gemini API and return an AISummary.
+ * Requires a valid CONTINUES_PRO_KEY (checked first).
+ * Throws ProKeyError if key is missing/invalid.
+ */
 export async function summariseWithGemini(
   session: UnifiedSession,
   toolSummaries: ToolUsageSummary[],
   apiKey?: string,
 ): Promise<AISummary> {
+  // --- Pro key gate ---
+  const proKey = process.env.CONTINUES_PRO_KEY;
+  if (!proKey) throw new ProKeyError();
+  await validateProKey(proKey);
+
+  // --- Gemini API key ---
   const key = apiKey || process.env.CONTINUES_GEMINI_KEY || process.env.GEMINI_API_KEY;
   if (!key) {
     throw new Error(
@@ -112,6 +168,10 @@ export async function summariseWithGemini(
   }
 }
 
+/**
+ * Format an AISummary into a markdown handoff block suitable for
+ * injection into any target tool's prompt.
+ */
 export function formatAISummary(summary: AISummary): string {
   const lines: string[] = [
     '## AI-Generated Session Handoff',
